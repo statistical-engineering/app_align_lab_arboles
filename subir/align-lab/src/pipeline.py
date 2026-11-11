@@ -106,41 +106,48 @@ def _shrink(image: np.ndarray, max_side: int):
     return cv2.resize(image, None, fx=f, fy=f, interpolation=cv2.INTER_AREA), f
 
 
+WORK_SIDE = 1600  # lado máximo con el que se buscan puntos clave (memoria y velocidad)
+
+
 def align_images_robust(image: np.ndarray, template: np.ndarray, params: AlignParams,
                         template_mask: np.ndarray | None = None) -> AlignResult:
     """Intenta alinear con varias configuraciones y devuelve el mejor resultado.
 
-    Empieza con los parámetros pedidos; si falla o hay pocos inliers, prueba con un ratio más
-    tolerante, con la foto reducida (las fotos de celular muy grandes llenan los puntos de pasto)
-    y con el otro detector. Gana el intento con más inliers.
+    Las fotos de celular (12 MP o más) se reducen a ``WORK_SIDE`` antes de buscar puntos clave:
+    a resolución completa SIFT necesita casi 3 GB de memoria y el servidor gratuito cierra la app.
+    La homografía final se aplica sobre la foto original, así que la imagen alineada no pierde nitidez.
+
+    Intentos: parámetros pedidos; ratio más tolerante; foto aún más reducida; el otro detector.
+    Gana el intento con más inliers.
     """
-    attempts = [(params, None)]
-    attempts.append((AlignParams(**{**asdict(params), "ratio": min(0.85, params.ratio + 0.07)}), None))
-    attempts.append((params, 1600))
+    work, f = _shrink(image, WORK_SIDE)
+    attempts = [(params, 1.0)]
+    attempts.append((AlignParams(**{**asdict(params), "ratio": min(0.85, params.ratio + 0.07)}), 1.0))
+    attempts.append((params, 0.65))
     other = [d for d in detectors.available_detectors() if d != detectors.resolve_detector_name(params.detector)]
     if other:
-        attempts.append((AlignParams(**{**asdict(params), "detector": other[0], "ratio": 0.8}), 1600))
+        attempts.append((AlignParams(**{**asdict(params), "detector": other[0], "ratio": 0.8}), 1.0))
 
-    best, first_error = None, None
-    for p, max_side in attempts:
+    best, best_scale, first_error = None, 1.0, None
+    for p, extra in attempts:
         try:
-            small, f = _shrink(image, max_side) if max_side else (image, 1.0)
+            small, g = _shrink(work, int(max(work.shape[:2]) * extra)) if extra < 1.0 else (work, 1.0)
             result = align_images(small, template, p, template_mask=template_mask)
-            if f != 1.0:  # aplicar la homografía a la foto original para no perder resolución
-                H = result.H @ np.diag([f, f, 1.0])
-                aligned, coverage = registration.warp_to_template(image, H, template.shape)
-                result = replace(result, H=H, aligned=visualization.to_bgr(aligned), coverage=coverage,
-                                 input_bgr=visualization.to_bgr(image))
         except Exception as exc:  # noqa: BLE001 — se reintenta con la siguiente configuración
             first_error = first_error or exc
             continue
         if best is None or result.metrics["inliers"] > best.metrics["inliers"]:
-            best = result
+            best, best_scale = result, f * g
         if best.metrics["inliers"] >= MIN_GOOD_INLIERS * 2:
             break
     if best is None:
         raise first_error
-    return best
+
+    # Homografía en coordenadas de la foto original y warp a resolución completa.
+    H = best.H @ np.diag([best_scale, best_scale, 1.0])
+    aligned, coverage = registration.warp_to_template(image, H, template.shape)
+    return replace(best, H=H, aligned=visualization.to_bgr(aligned), coverage=coverage,
+                   input_bgr=visualization.to_bgr(work))  # la vista previa usa la versión reducida
 
 
 def align_images(image: np.ndarray, template: np.ndarray, params: AlignParams,
