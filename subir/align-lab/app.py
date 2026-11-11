@@ -6,7 +6,11 @@ endereza contra la plantilla fija (``assets/plantilla.*``) y lee el texto.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import html
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -251,23 +255,69 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+MAX_AT_ONCE = 1  # fotos que se procesan a la vez (cada una tarda ~3 s; las demás esperan su turno)
+
+
+@st.cache_resource
+def processing_slots() -> threading.Semaphore:
+    """Fila de espera compartida por todos los usuarios de la app.
+
+    La memoria del servidor (unos 2,7 GB en Community Cloud) es una sola para todos. Si muchos
+    pulsan el botón a la vez y se procesan todas juntas, el servidor se queda sin memoria y la
+    app se cae. Con este semáforo, como máximo ``MAX_AT_ONCE`` fotos se procesan en paralelo
+    y las demás esperan su turno unos segundos.
+    """
+    return threading.Semaphore(MAX_AT_ONCE)
+
+
+def release_memory() -> None:
+    """Libera la memoria apenas termina una foto y se la devuelve al sistema operativo.
+
+    Python y la librería de C a veces retienen la memoria ya liberada; ``malloc_trim`` la devuelve
+    para que la app no vaya acumulando memoria con cada foto.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):  # Windows o macOS: no aplica
+        pass
+
+
+def slim(result):
+    """Guarda en la sesión solo lo que se muestra; descarta las imágenes intermedias pesadas."""
+    return replace(result, matches_img=None, inliers_img=None, differences=None,
+                   differences_gray=None, overlay=None, coverage=None, template_bgr=None)
+
+
 if run and image is not None and template is not None:
-    st.session_state.pop("run_error", None)
-    st.session_state.pop("ocr", None)
-    st.session_state.pop("ocr_error", None)
-    with st.spinner("Buscando puntos en común con la plantilla y enderezando la foto…"):
+    for key in ("result", "run_error", "ocr", "ocr_error"):
+        st.session_state.pop(key, None)
+    slots = processing_slots()
+    got_slot = slots.acquire(blocking=False)
+    if not got_slot:
+        with st.spinner("Hay otras personas usando la app en este momento. Tu foto está en la fila; "
+                        "espera unos segundos…"):
+            got_slot = slots.acquire(timeout=120)
+    if not got_slot:
+        st.session_state["run_error"] = ("La app está muy ocupada en este momento. "
+                                         "Espera un minuto y vuelve a pulsar «Enderezar y leer».")
+    else:
         try:
-            st.session_state["result"] = align_images_robust(image, template, params,
-                                                             template_mask=template_mask(template.shape))
-        except Exception as exc:  # los errores se explican sin traza
-            st.session_state.pop("result", None)
-            st.session_state["run_error"] = str(exc)
-    if "result" in st.session_state:
-        with st.spinner("Leyendo el texto de la placa…"):
-            try:
-                st.session_state["ocr"] = ocr.extract_fields(st.session_state["result"].aligned)
-            except Exception as exc:
-                st.session_state["ocr_error"] = str(exc)
+            with st.spinner("Buscando puntos en común con la plantilla y enderezando la foto…"):
+                try:
+                    st.session_state["result"] = slim(align_images_robust(
+                        image, template, params, template_mask=template_mask(template.shape)))
+                except Exception as exc:  # los errores se explican sin traza
+                    st.session_state["run_error"] = str(exc)
+            if "result" in st.session_state:
+                with st.spinner("Leyendo el texto de la placa…"):
+                    try:
+                        st.session_state["ocr"] = ocr.extract_fields(st.session_state["result"].aligned)
+                    except Exception as exc:
+                        st.session_state["ocr_error"] = str(exc)
+        finally:
+            slots.release()
+            release_memory()
 
 result = st.session_state.get("result")
 
