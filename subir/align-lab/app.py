@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 from pathlib import Path
 
+import cv2
 import numpy as np
 import streamlit as st
 
@@ -108,8 +109,19 @@ section[data-testid="stSidebar"] { border-right: 3px solid var(--bosque); }
 st.markdown(CSS, unsafe_allow_html=True)
 
 
+PREVIEW_SIDE = 1400  # las vistas previas no necesitan la resolución de la cámara
+
+
 def show_image(img, caption=None):
-    """Muestra una imagen BGR ajustada al ancho, compatible con varias versiones de Streamlit."""
+    """Muestra una imagen BGR ajustada al ancho, compatible con varias versiones de Streamlit.
+
+    Se reduce antes de enviarla al navegador: una foto de celular de 12 MP pesa mucho en memoria
+    y tarda en cargar en el teléfono.
+    """
+    h, w = img.shape[:2]
+    if max(h, w) > PREVIEW_SIDE:
+        f = PREVIEW_SIDE / max(h, w)
+        img = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
     rgb = visualization.bgr_to_rgb(img)
     try:
         st.image(rgb, caption=caption, width="stretch")
